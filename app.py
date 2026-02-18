@@ -104,74 +104,79 @@ if not dat_files_data:
     st.info("Upload or select .dat files to begin analysis.")
     st.stop()
 
-if not process_btn:
+if process_btn:
+    # Sort files by name for consistent ordering
+    sorted_files = sorted(dat_files_data.keys())
+    st.write(f"Processing **{len(sorted_files)}** files: {', '.join(sorted_files)}")
+
+    # Check consecutiveness
+    if len(sorted_files) >= 2:
+        file_bytes = [dat_files_data[fn] for fn in sorted_files]
+        consecutive = are_files_consecutive(file_bytes)
+        if consecutive:
+            st.success("Files are consecutive (packet numbers follow sequentially)")
+        else:
+            st.warning("Files are NOT consecutive - gaps detected between packets")
+
+    # Process each file
+    all_results = {}
+    progress = st.progress(0, text="Parsing files...")
+
+    for idx, fname in enumerate(sorted_files):
+        progress.progress((idx + 1) / len(sorted_files), text=f"Processing {fname}...")
+        try:
+            raw_data = dat_files_data[fname]
+            lead1_raw, lead2_raw = parse_dat_file(raw_data)
+
+            # Preprocess (HP filter + resample 125->200 Hz + notch)
+            lead1 = preprocess_dat_signal(lead1_raw, notch_freqs=notch_freq)
+            lead2 = preprocess_dat_signal(lead2_raw, notch_freqs=notch_freq)
+
+            # QRS detection on both leads
+            markers1 = detect_qrs(lead1, fs=200)
+            markers2 = detect_qrs(lead2, fs=200)
+
+            # Heart rate stats
+            hr1 = compute_heart_rate(markers1, fs=200)
+            hr2 = compute_heart_rate(markers2, fs=200)
+
+            # Pick best lead (lower HR std = more reliable, matching C# decide())
+            if hr1["hr_std"] <= hr2["hr_std"] and hr1["hr_mean"] > 0:
+                best_lead_idx = 1
+            else:
+                best_lead_idx = 2
+
+            # Quality analysis
+            quality = analyze_holter_quality(lead1, lead2, sampling_rate=200)
+
+            all_results[fname] = {
+                "lead1_raw": lead1_raw,
+                "lead2_raw": lead2_raw,
+                "lead1": lead1,
+                "lead2": lead2,
+                "markers1": markers1,
+                "markers2": markers2,
+                "hr1": hr1,
+                "hr2": hr2,
+                "best_lead": best_lead_idx,
+                "quality": quality,
+            }
+        except Exception as e:
+            st.error(f"Error processing {fname}: {e}")
+
+    progress.empty()
+
+    if all_results:
+        st.session_state["results"] = all_results
+    else:
+        st.error("No files processed successfully.")
+        st.stop()
+
+if "results" not in st.session_state:
     st.info(f"{len(dat_files_data)} files loaded. Click **Analyze** to process.")
     st.stop()
 
-# Sort files by name for consistent ordering
-sorted_files = sorted(dat_files_data.keys())
-st.write(f"Processing **{len(sorted_files)}** files: {', '.join(sorted_files)}")
-
-# Check consecutiveness
-if len(sorted_files) >= 2:
-    file_bytes = [dat_files_data[fn] for fn in sorted_files]
-    consecutive = are_files_consecutive(file_bytes)
-    if consecutive:
-        st.success("Files are consecutive (packet numbers follow sequentially)")
-    else:
-        st.warning("Files are NOT consecutive - gaps detected between packets")
-
-# Process each file
-all_results = {}
-progress = st.progress(0, text="Parsing files...")
-
-for idx, fname in enumerate(sorted_files):
-    progress.progress((idx + 1) / len(sorted_files), text=f"Processing {fname}...")
-    try:
-        raw_data = dat_files_data[fname]
-        lead1_raw, lead2_raw = parse_dat_file(raw_data)
-
-        # Preprocess (HP filter + resample 125->200 Hz + notch)
-        lead1 = preprocess_dat_signal(lead1_raw, notch_freqs=notch_freq)
-        lead2 = preprocess_dat_signal(lead2_raw, notch_freqs=notch_freq)
-
-        # QRS detection on both leads
-        markers1 = detect_qrs(lead1, fs=200)
-        markers2 = detect_qrs(lead2, fs=200)
-
-        # Heart rate stats
-        hr1 = compute_heart_rate(markers1, fs=200)
-        hr2 = compute_heart_rate(markers2, fs=200)
-
-        # Pick best lead (lower HR std = more reliable, matching C# decide())
-        if hr1["hr_std"] <= hr2["hr_std"] and hr1["hr_mean"] > 0:
-            best_lead_idx = 1
-        else:
-            best_lead_idx = 2
-
-        # Quality analysis
-        quality = analyze_holter_quality(lead1, lead2, sampling_rate=200)
-
-        all_results[fname] = {
-            "lead1_raw": lead1_raw,
-            "lead2_raw": lead2_raw,
-            "lead1": lead1,
-            "lead2": lead2,
-            "markers1": markers1,
-            "markers2": markers2,
-            "hr1": hr1,
-            "hr2": hr2,
-            "best_lead": best_lead_idx,
-            "quality": quality,
-        }
-    except Exception as e:
-        st.error(f"Error processing {fname}: {e}")
-
-progress.empty()
-
-if not all_results:
-    st.error("No files processed successfully.")
-    st.stop()
+all_results = st.session_state["results"]
 
 # -- Results display -----------------------------------------------------------
 
@@ -281,7 +286,7 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
 
             # Lead 1
             fig.add_trace(
-                go.Scattergl(
+                go.Scatter(
                     x=time_axis,
                     y=lead1,
                     mode="lines",
@@ -295,7 +300,7 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
 
             # Lead 2
             fig.add_trace(
-                go.Scattergl(
+                go.Scatter(
                     x=time_axis2,
                     y=lead2,
                     mode="lines",
@@ -360,8 +365,16 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
             st.plotly_chart(fig, use_container_width=True)
 
         # -- Raw vs Filtered comparison --
-        with st.expander("Raw vs Filtered Comparison"):
-            lead_choice = st.radio("Lead", [1, 2], horizontal=True, key=f"raw_{fname}")
+        raw_open_key = f"raw_open_{fname}"
+        with st.expander(
+            "Raw vs Filtered Comparison",
+            expanded=st.session_state.get(raw_open_key, False),
+        ):
+            lead_choice = st.radio(
+                "Lead", [1, 2], horizontal=True,
+                key=f"raw_{fname}",
+                on_change=lambda k=raw_open_key: st.session_state.__setitem__(k, True),
+            )
             raw = result["lead1_raw"] if lead_choice == 1 else result["lead2_raw"]
             filt = result["lead1"] if lead_choice == 1 else result["lead2"]
 
@@ -375,7 +388,7 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                 subplot_titles=("Raw (125 Hz)", "Filtered (200 Hz)"),
             )
             comp_fig.add_trace(
-                go.Scattergl(
+                go.Scatter(
                     x=raw_time,
                     y=raw,
                     mode="lines",
@@ -386,7 +399,7 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                 col=1,
             )
             comp_fig.add_trace(
-                go.Scattergl(
+                go.Scatter(
                     x=filt_time,
                     y=filt,
                     mode="lines",
