@@ -1,0 +1,4 @@
+{
+  "_comment": "ECG quality analysis presets. Low_SNR thresholds are intentionally inverted: [good_snr, bad_snr] because higher SNR = better quality.",
+  "default": "holter_200hz"
+}

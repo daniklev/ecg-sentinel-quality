@@ -1,0 +1,29 @@
+{
+  "thresholds": {
+    "Muscle_Artifact": [0.03, 0.08],
+    "Bad_Electrode_Contact": [15, 600],
+    "Powerline_Interference": [0.005, 0.03],
+    "Baseline_Drift": [0.02, 0.70],
+    "Low_SNR": [25, 15]
+  },
+  "_threshold_docs": {
+    "format": "[boundary_low, boundary_high]",
+    "Low_SNR": "INVERTED: [good_threshold, bad_threshold]"
+  },
+  "flags_weights": {
+    "Muscle_Artifact": 0.2,
+    "Bad_Electrode_Contact": 0.25,
+    "Powerline_Interference": 0.15,
+    "Baseline_Drift": 0.2,
+    "Low_SNR": 0.2
+  },
+  "neurokit": {
+    "enabled": true,
+    "method": "averageQRS",
+    "weight": 0.20
+  },
+  "grade_thresholds": {
+    "good": 0.90,
+    "questionable": 0.70
+  }
+}

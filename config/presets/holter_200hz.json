@@ -1,0 +1,29 @@
+{
+  "thresholds": {
+    "Muscle_Artifact": [0.045, 0.10],
+    "Bad_Electrode_Contact": [10, 800],
+    "Powerline_Interference": [0.01, 0.05],
+    "Baseline_Drift": [0.03, 0.90],
+    "Low_SNR": [22, 12]
+  },
+  "_threshold_docs": {
+    "format": "[boundary_low, boundary_high] — flag severity interpolated 0-1 between boundaries",
+    "Low_SNR": "INVERTED: [good_threshold, bad_threshold] — high SNR maps to low flag severity, low SNR maps to high severity"
+  },
+  "flags_weights": {
+    "Muscle_Artifact": 0.2,
+    "Bad_Electrode_Contact": 0.25,
+    "Powerline_Interference": 0.15,
+    "Baseline_Drift": 0.2,
+    "Low_SNR": 0.2
+  },
+  "neurokit": {
+    "enabled": true,
+    "method": "averageQRS",
+    "weight": 0.15
+  },
+  "grade_thresholds": {
+    "good": 0.85,
+    "questionable": 0.65
+  }
+}

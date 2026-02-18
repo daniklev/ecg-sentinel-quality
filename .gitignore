@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .streamlit/
 data/*.dat
+_bmad/
+_bmad-output/
+.claude/
