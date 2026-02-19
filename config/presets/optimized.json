@@ -1,0 +1,41 @@
+{
+  "_preset_name": "optimized",
+  "thresholds": {
+    "Muscle_Artifact": [
+      0.11874274114552308,
+      0.705741257940397
+    ],
+    "Bad_Electrode_Contact": [
+      118.84883627255317,
+      1531.8157294657262
+    ],
+    "Powerline_Interference": [
+      0.7773052690676082,
+      0.93849800866948
+    ],
+    "Baseline_Drift": [
+      0.3568727300766999,
+      0.7831721472280592
+    ],
+    "Low_SNR": [
+      26.19653335961824,
+      25.782653081596614
+    ]
+  },
+  "flags_weights": {
+    "Muscle_Artifact": 0.5567712103868097,
+    "Bad_Electrode_Contact": 0.5020174311784575,
+    "Powerline_Interference": 0.007147734643212389,
+    "Baseline_Drift": 5.0689482048504875e-05,
+    "Low_SNR": 0.1301600515643957
+  },
+  "grade_thresholds": {
+    "good": 0.9737739648739586,
+    "questionable": 0.5315270203193021
+  },
+  "neurokit": {
+    "enabled": true,
+    "method": "orphanidou2015",
+    "weight": 0.48000669031891613
+  }
+}

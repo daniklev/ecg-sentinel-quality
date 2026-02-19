@@ -16,6 +16,12 @@ import streamlit as st
 from plotly.subplots import make_subplots
 from src.dat_parser import are_files_consecutive, parse_dat_file
 from src.filters import preprocess_dat_signal
+from src.optimizer import (
+    GRADE_TARGETS,
+    decode_vector,
+    evaluate_config,
+    run_optimization,
+)
 from src.qrs_detector import compute_heart_rate, detect_qrs
 from src.quality import analyze_holter_quality, load_all_presets, save_preset
 
@@ -45,8 +51,23 @@ st.set_page_config(
     layout="wide",
 )
 
+# Reduce dead space above sidebar tabs
+st.markdown(
+    """
+    <style>
+    section[data-testid="stSidebar"] > div:first-child {
+        padding-top: 1rem;
+    }
+    section[data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] {
+        padding-top: 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("ECG Sentinel Quality Analyzer")
-st.caption("Minimal testing environment for Sentinel Holter .dat files")
+st.caption("Testing environment for Sentinel Holter .dat files")
 
 # -- Sidebar: file selection & parameters --------------------------------------
 
@@ -114,14 +135,100 @@ def _on_preset_change() -> None:
     _populate_config_state(st.session_state["cfg_preset"])
 
 
+def _build_quality_config() -> dict:
+    """Build quality config dict from current session state sliders."""
+    return {
+        "_preset_name": st.session_state.get("cfg_preset", "custom"),
+        "thresholds": {
+            flag: (
+                st.session_state.get(f"cfg_thresh_{flag}_low", 0.0),
+                st.session_state.get(f"cfg_thresh_{flag}_high", 0.0),
+            )
+            for flag in _FLAG_NAMES
+        },
+        "flags_weights": {
+            flag: st.session_state.get(f"cfg_weight_{flag}", 0.2)
+            for flag in _FLAG_NAMES
+        },
+        "neurokit": {
+            "enabled": st.session_state.get("cfg_nk_enabled", False),
+            "method": st.session_state.get("cfg_nk_method", "averageQRS"),
+            "weight": st.session_state.get("cfg_nk_weight", 0.0),
+        },
+        "grade_thresholds": {
+            "good": st.session_state.get("cfg_grade_good", 0.85),
+            "questionable": st.session_state.get("cfg_grade_questionable", 0.65),
+        },
+    }
+
+
+def _apply_optimized_config(config: dict) -> None:
+    """Write optimizer result into cfg_* session state keys."""
+    thresholds = config.get("thresholds", {})
+    for flag_name in _FLAG_NAMES:
+        bounds = thresholds.get(flag_name, (0.0, 1.0))
+        st.session_state[f"cfg_thresh_{flag_name}_low"] = float(bounds[0])
+        st.session_state[f"cfg_thresh_{flag_name}_high"] = float(bounds[1])
+    weights = config.get("flags_weights", {})
+    for flag_name in _FLAG_NAMES:
+        st.session_state[f"cfg_weight_{flag_name}"] = float(weights.get(flag_name, 0.2))
+    grades = config.get("grade_thresholds", {})
+    st.session_state["cfg_grade_good"] = float(grades.get("good", 0.85))
+    st.session_state["cfg_grade_questionable"] = float(grades.get("questionable", 0.65))
+    nk = config.get("neurokit", {})
+    st.session_state["cfg_nk_enabled"] = bool(nk.get("enabled", False))
+    st.session_state["cfg_nk_method"] = nk.get("method", "averageQRS")
+    st.session_state["cfg_nk_weight"] = float(nk.get("weight", 0.0))
+
+
+def _guess_grade(folder_name: str) -> str:
+    """Heuristic default grade from folder name keywords."""
+    name = folder_name.lower()
+    # Keywords suggesting bad quality
+    bad_keywords = [
+        "no signal",
+        "no electrode",
+        "line no",
+        "flat",
+        "disconnect",
+        "no contact",
+        "dead",
+    ]
+    for kw in bad_keywords:
+        if kw in name:
+            return "Not usable"
+    # Keywords suggesting questionable quality
+    quest_keywords = [
+        "noise",
+        "artefact",
+        "artifact",
+        "drift",
+        "interference",
+        "nooise",
+        "spike",
+        "pause",
+        "small noise",
+    ]
+    for kw in quest_keywords:
+        if kw in name:
+            return "Questionable"
+    # Keywords suggesting good quality
+    good_keywords = ["normal", "clean", "good", "rest"]
+    for kw in good_keywords:
+        if kw in name:
+            return "Good"
+    return "Questionable"
+
+
 # -- Sidebar: tabs for Input & Config -----------------------------------------
 
 with st.sidebar:
-    sidebar_input_tab, sidebar_config_tab = st.tabs(["Input", "Config"])
+    sidebar_input_tab, sidebar_config_tab, sidebar_optimize_tab = st.tabs(
+        ["Input", "Config", "Optimize"]
+    )
 
     # ---- Input Tab ----
     with sidebar_input_tab:
-        st.header("Input")
 
         input_mode = st.radio(
             "Source", ["Select folder", "Upload files"], horizontal=True
@@ -189,7 +296,6 @@ with st.sidebar:
 
     # ---- Config Tab ----
     with sidebar_config_tab:
-        st.header("Quality Config")
 
         # Reload presets to pick up any saves during this session
         _live_presets = _cached_load_presets()
@@ -390,6 +496,229 @@ with st.sidebar:
                     _cached_load_presets.clear()
                     st.success(f"Preset '{target_name}' saved.")
 
+    # ---- Optimize Tab ----
+    with sidebar_optimize_tab:
+        st.subheader("Test Data")
+
+        opt_base_folder = st.text_input(
+            "Test data folder", value="data", key="opt_base_folder"
+        )
+
+        # Discover subfolders with .dat files
+        _opt_folders = []
+        if opt_base_folder and os.path.isdir(opt_base_folder):
+            for d in sorted(os.listdir(opt_base_folder)):
+                dp = os.path.join(opt_base_folder, d)
+                if os.path.isdir(dp):
+                    count = len(glob.glob(os.path.join(dp, "*.dat")))
+                    if count > 0:
+                        _opt_folders.append((d, count))
+
+        if _opt_folders:
+            st.caption(
+                f"Found {len(_opt_folders)} folders, "
+                f"{sum(c for _, c in _opt_folders)} files"
+            )
+
+            st.subheader("Expected Grades")
+            _grade_options = list(GRADE_TARGETS.keys())
+            _folder_grades = {}
+            for folder_name, file_count in _opt_folders:
+                default_grade = _guess_grade(folder_name)
+                default_idx = (
+                    _grade_options.index(default_grade)
+                    if default_grade in _grade_options
+                    else 1
+                )
+                grade = st.selectbox(
+                    f"{folder_name} ({file_count})",
+                    options=_grade_options,
+                    index=default_idx,
+                    key=f"opt_grade_{folder_name}",
+                )
+                _folder_grades[folder_name] = grade
+
+            st.subheader("Settings")
+            opt_maxiter = st.number_input(
+                "Max generations",
+                min_value=5,
+                max_value=500,
+                value=100,
+                step=5,
+                key="opt_maxiter",
+            )
+            opt_popsize = st.number_input(
+                "Population size",
+                min_value=5,
+                max_value=100,
+                value=30,
+                step=5,
+                key="opt_popsize",
+            )
+            opt_seed = st.number_input(
+                "Random seed (0=random)",
+                min_value=0,
+                max_value=99999,
+                value=42,
+                key="opt_seed",
+            )
+
+            opt_notch = st.multiselect(
+                "Notch freqs (Hz)",
+                options=[50, 60, 100],
+                default=[50, 100],
+                key="opt_notch",
+            )
+
+            optimize_btn = st.button(
+                "Run Optimization", type="primary", width="stretch"
+            )
+
+            if optimize_btn:
+                st.session_state["_opt_folder_grades"] = _folder_grades
+                st.session_state["_opt_run"] = True
+        else:
+            st.warning("No test folders with .dat files found")
+            optimize_btn = False
+
+# -- Optimization execution (main area) ----------------------------------------
+
+if st.session_state.get("_opt_run"):
+    st.session_state["_opt_run"] = False
+    _opt_fg = st.session_state.get("_opt_folder_grades", {})
+    _opt_bf = st.session_state.get("opt_base_folder", "data")
+    _opt_notch = st.session_state.get("opt_notch", [50, 100])
+    _opt_maxiter = st.session_state.get("opt_maxiter", 100)
+    _opt_popsize = st.session_state.get("opt_popsize", 30)
+    _opt_seed_val = st.session_state.get("opt_seed", 42)
+    _opt_seed = _opt_seed_val if _opt_seed_val > 0 else None
+
+    _opt_progress = st.progress(0, text="Starting optimization...")
+
+    def _update_progress(stage: str, frac: float):
+        _opt_progress.progress(min(frac, 1.0), text=stage)
+
+    try:
+        opt_result = run_optimization(
+            base_folder=_opt_bf,
+            folder_grades=_opt_fg,
+            notch_freqs=_opt_notch,
+            current_config=_build_quality_config(),
+            thresh_config=_THRESH_CONFIG,
+            maxiter=_opt_maxiter,
+            popsize=_opt_popsize,
+            seed=_opt_seed,
+            progress_callback=_update_progress,
+        )
+        _opt_progress.empty()
+        st.session_state["_opt_result"] = opt_result
+    except Exception as exc:
+        _opt_progress.empty()
+        st.error(f"Optimization failed: {exc}")
+
+if "_opt_result" in st.session_state:
+    opt_result = st.session_state["_opt_result"]
+
+    st.subheader("Optimization Results")
+
+    # Metrics row
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        st.metric("Best Loss", f"{opt_result.best_loss:.4f}")
+    with mc2:
+        st.metric("Evaluations", f"{opt_result.n_evaluations:,}")
+    with mc3:
+        elapsed_m = opt_result.elapsed_seconds / 60
+        st.metric("Time", f"{elapsed_m:.1f} min")
+
+    # Before / After comparison table
+    st.subheader("Before vs After")
+    _comp_rows = []
+    for before, after in zip(opt_result.before_results, opt_result.after_results):
+        _comp_rows.append(
+            {
+                "Folder": before["folder"],
+                "Expected": before["expected_grade"],
+                "Before Score": f"{before['avg_score']:.3f}",
+                "Before Grade": before["actual_grade"],
+                "After Score": f"{after['avg_score']:.3f}",
+                "After Grade": after["actual_grade"],
+                "Match": "Yes" if after["match"] else "No",
+            }
+        )
+    st.table(_comp_rows)
+
+    # Match summary
+    _matches_before = sum(1 for r in opt_result.before_results if r["match"])
+    _matches_after = sum(1 for r in opt_result.after_results if r["match"])
+    _total = len(opt_result.after_results)
+    st.caption(
+        f"Grade matches: {_matches_before}/{_total} before -> "
+        f"{_matches_after}/{_total} after"
+    )
+
+    # Convergence chart
+    if opt_result.convergence_history:
+        conv_fig = go.Figure()
+        conv_fig.add_trace(
+            go.Scatter(
+                y=opt_result.convergence_history,
+                mode="lines+markers",
+                line=dict(color="#00ffff"),
+                name="Best loss",
+            )
+        )
+        conv_fig.update_layout(
+            title="Convergence (best loss per generation)",
+            xaxis_title="Generation",
+            yaxis_title="Loss",
+            height=300,
+            template="plotly_dark",
+        )
+        st.plotly_chart(conv_fig, use_container_width=True)
+
+    # Optimized parameters (expandable)
+    with st.expander("Optimized Parameters"):
+        best_cfg = opt_result.best_config
+        st.markdown("**Thresholds**")
+        for flag, bounds in best_cfg["thresholds"].items():
+            st.caption(f"{flag}: [{bounds[0]:.4f}, {bounds[1]:.4f}]")
+        st.markdown("**Weights**")
+        for flag, w in best_cfg["flags_weights"].items():
+            st.caption(f"{flag}: {w:.4f}")
+        w_sum = sum(best_cfg["flags_weights"].values())
+        st.caption(f"Weight sum: {w_sum:.4f}")
+        st.markdown("**Grade Thresholds**")
+        st.caption(
+            f"Good: {best_cfg['grade_thresholds']['good']:.4f}, "
+            f"Questionable: {best_cfg['grade_thresholds']['questionable']:.4f}"
+        )
+        st.markdown("**NeuroKit**")
+        nk = best_cfg["neurokit"]
+        st.caption(
+            f"Enabled: {nk['enabled']}, "
+            f"Method: {nk['method']}, "
+            f"Weight: {nk['weight']:.4f}"
+        )
+
+    # Action buttons
+    acol1, acol2 = st.columns(2)
+    with acol1:
+        if st.button("Apply to Config", type="primary"):
+            _apply_optimized_config(opt_result.best_config)
+            st.success("Config updated! Switch to Config tab to see values.")
+    with acol2:
+        save_name = st.text_input("Preset name", value="optimized", key="opt_save_name")
+        if st.button("Save as Preset"):
+            if save_name and _PRESET_NAME_RE.match(save_name.strip()):
+                save_preset(save_name.strip(), opt_result.best_config)
+                _cached_load_presets.clear()
+                st.success(f"Saved preset '{save_name.strip()}'")
+            else:
+                st.error(
+                    "Invalid name (1-64 chars: letters, digits, hyphens, underscores)"
+                )
+
 # -- Processing ----------------------------------------------------------------
 
 if not dat_files_data:
@@ -422,29 +751,7 @@ if process_btn:
         st.stop()
 
     # Build quality config dict from session state sliders
-    quality_config = {
-        "_preset_name": st.session_state.get("cfg_preset", "custom"),
-        "thresholds": {
-            flag: (
-                st.session_state.get(f"cfg_thresh_{flag}_low", 0.0),
-                st.session_state.get(f"cfg_thresh_{flag}_high", 0.0),
-            )
-            for flag in _FLAG_NAMES
-        },
-        "flags_weights": {
-            flag: st.session_state.get(f"cfg_weight_{flag}", 0.2)
-            for flag in _FLAG_NAMES
-        },
-        "neurokit": {
-            "enabled": st.session_state.get("cfg_nk_enabled", False),
-            "method": st.session_state.get("cfg_nk_method", "averageQRS"),
-            "weight": st.session_state.get("cfg_nk_weight", 0.0),
-        },
-        "grade_thresholds": {
-            "good": st.session_state.get("cfg_grade_good", 0.85),
-            "questionable": st.session_state.get("cfg_grade_questionable", 0.65),
-        },
-    }
+    quality_config = _build_quality_config()
 
     # Sort files by name for consistent ordering
     sorted_files = sorted(dat_files_data.keys())
@@ -575,7 +882,9 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                     score_parts = [f"PSD: {psd_q:.3f}"]
                     if nk_enabled and nk_q is not None:
                         score_parts.append(f"NK: {nk_q:.3f}")
-                        score_parts.append(f"Weight: {1 - nk_weight:.0%}/{nk_weight:.0%}")
+                        score_parts.append(
+                            f"Weight: {1 - nk_weight:.0%}/{nk_weight:.0%}"
+                        )
                     elif nk_enabled:
                         score_parts.append("NK: N/A")
                     st.caption(" | ".join(score_parts))
