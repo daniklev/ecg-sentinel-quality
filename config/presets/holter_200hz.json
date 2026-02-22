@@ -15,7 +15,8 @@
     "Bad_Electrode_Contact": 0.25,
     "Powerline_Interference": 0.15,
     "Baseline_Drift": 0.2,
-    "Low_SNR": 0.2
+    "Low_SNR": 0.2,
+    "QRS_Count_Mismatch": 0.10
   },
   "neurokit": {
     "enabled": true,

@@ -27,7 +27,8 @@
     "Bad_Electrode_Contact": 0.5020174311784575,
     "Powerline_Interference": 0.007147734643212389,
     "Baseline_Drift": 5.0689482048504875e-05,
-    "Low_SNR": 0.1301600515643957
+    "Low_SNR": 0.1301600515643957,
+    "QRS_Count_Mismatch": 0.10
   },
   "grade_thresholds": {
     "good": 0.9737739648739586,

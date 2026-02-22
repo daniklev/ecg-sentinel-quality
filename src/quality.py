@@ -30,6 +30,7 @@ FLAGS_WEIGHTS: Dict[str, float] = {
     "Powerline_Interference": 0.15,
     "Baseline_Drift": 0.2,
     "Low_SNR": 0.2,
+    "QRS_Count_Mismatch": 0.10,
 }
 
 FLAG_MESSAGES: Dict[str, str] = {
@@ -38,6 +39,7 @@ FLAG_MESSAGES: Dict[str, str] = {
     "Powerline_Interference": "Power-line interference detected",
     "Baseline_Drift": "Baseline drift present",
     "Low_SNR": "Low signal-to-noise ratio",
+    "QRS_Count_Mismatch": "QRS detector disagreement",
 }
 
 _FALLBACK_CONFIG: Dict[str, Any] = {
@@ -299,12 +301,18 @@ def analyze_holter_quality(
     window_sec: float = 5,
     preset: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
+    markers1: Optional[np.ndarray] = None,
+    markers2: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Analyze quality of 2-lead Holter recording.
-    Segments into windows, finds best window (~5 sec) for PSD metrics.
+    Segments into windows and aggregates ALL windows for PSD metrics (not just the best).
+    Best-window scores are kept separately for diagnostics.
     NeuroKit2 quality runs on the full signal and blends with PSD at the end.
     Uses best-lead selection (max) instead of weighted average.
+
+    markers1/markers2: optional QRS marker arrays from detect_qrs() (Nx2, col0=pos, col1=type).
+    When provided together with NeuroKit, a QRS_Count_Mismatch flag is computed.
 
     When `config` is provided, uses it directly instead of loading from file.
     When `config` is None, falls back to `load_quality_config(preset)`.
@@ -316,12 +324,14 @@ def analyze_holter_quality(
     nwin = n // wlen if wlen > 0 else 0
 
     if nwin == 0:
-        _empty_values = {"m_a": 0.0, "b_e_c": 0.0, "p_i": 0.0, "b_d": 0.0, "snr": 0.0, "qrs_amp": 0.0, "nk_quality": None, "nk_r_peaks_count": 0}
+        _empty_values = {"m_a": 0.0, "b_e_c": 0.0, "p_i": 0.0, "b_d": 0.0, "snr": 0.0, "qrs_amp": 0.0, "nk_quality": None, "nk_r_peaks_count": 0, "csharp_qrs_count": None}
         return {
             "lead1_quality": 0.0,
             "lead2_quality": 0.0,
             "lead1_psd_quality": 0.0,
             "lead2_psd_quality": 0.0,
+            "lead1_psd_best_quality": 0.0,
+            "lead2_psd_best_quality": 0.0,
             "overall_quality": 0.0,
             "grade": "Not usable",
             "lead1_flags": {},
@@ -362,7 +372,11 @@ def analyze_holter_quality(
             }
         )
 
-    # Find best consecutive window(s) (~5 sec total)
+    # All-window PSD scores (primary quality metric)
+    q1_psd_all = float(np.mean([w["lead1_score"] for w in window_results]))
+    q2_psd_all = float(np.mean([w["lead2_score"] for w in window_results]))
+
+    # Find best consecutive window(s) (~5 sec total) for diagnostics
     best_start = 0
     best_quality = -1.0
     windows_needed = max(1, int(5.0 / window_sec))
@@ -374,25 +388,27 @@ def analyze_holter_quality(
             best_start = start
 
     best_windows = window_results[best_start : best_start + windows_needed]
-    q1_psd_avg = float(np.mean([w["lead1_score"] for w in best_windows]))
-    q2_psd_avg = float(np.mean([w["lead2_score"] for w in best_windows]))
+    q1_psd_best = float(np.mean([w["lead1_score"] for w in best_windows]))
+    q2_psd_best = float(np.mean([w["lead2_score"] for w in best_windows]))
 
-    # Aggregate flags from best windows
+    # Aggregate flags from ALL windows (not just best)
     agg_flags1 = {}
     agg_flags2 = {}
     for flag in FLAG_MESSAGES:
-        vals1 = [w["lead1_flags"].get(flag, 0) for w in best_windows]
-        vals2 = [w["lead2_flags"].get(flag, 0) for w in best_windows]
+        if flag == "QRS_Count_Mismatch":
+            continue  # computed separately below
+        vals1 = [w["lead1_flags"].get(flag, 0) for w in window_results]
+        vals2 = [w["lead2_flags"].get(flag, 0) for w in window_results]
         agg_flags1[flag] = float(np.mean(vals1))
         agg_flags2[flag] = float(np.mean(vals2))
 
-    # Aggregate raw measurement values from best windows
+    # Aggregate raw measurement values from ALL windows
     _value_keys = ["m_a", "b_e_c", "p_i", "b_d", "snr", "qrs_amp"]
     lead1_values_agg = {}
     lead2_values_agg = {}
     for key in _value_keys:
-        lead1_values_agg[key] = float(np.mean([w["lead1_values"][key] for w in best_windows]))
-        lead2_values_agg[key] = float(np.mean([w["lead2_values"][key] for w in best_windows]))
+        lead1_values_agg[key] = float(np.mean([w["lead1_values"][key] for w in window_results]))
+        lead2_values_agg[key] = float(np.mean([w["lead2_values"][key] for w in window_results]))
 
     # NeuroKit2 quality on full signals (not windowed)
     nk_cfg = config.get("neurokit", {})
@@ -432,20 +448,59 @@ def analyze_holter_quality(
             except Exception as exc:
                 logger.warning("NeuroKit2 quality computation failed for lead %d: %s", lead_num, exc)
 
+    # QRS Count Mismatch flag — compare C# detect_qrs counts with NeuroKit R-peaks
+    mismatch_weight = config.get("flags_weights", {}).get("QRS_Count_Mismatch", FLAGS_WEIGHTS.get("QRS_Count_Mismatch", 0.10))
+    lead1_values_agg["csharp_qrs_count"] = None
+    lead2_values_agg["csharp_qrs_count"] = None
+    for lead_markers, lead_nk_peaks, lead_num in [
+        (markers1, lead1_nk_r_peaks, 1),
+        (markers2, lead2_nk_r_peaks, 2),
+    ]:
+        if lead_markers is not None and len(lead_markers) > 0:
+            # Count all detected beats from C# detector (type 1=normal, 0=noise).
+            # We use total count (not just normal) because NeuroKit also counts
+            # all R-peaks without distinguishing beat types.
+            csharp_count = len(lead_markers)
+            if lead_num == 1:
+                lead1_values_agg["csharp_qrs_count"] = csharp_count
+            else:
+                lead2_values_agg["csharp_qrs_count"] = csharp_count
+
+            # Only compute mismatch if NeuroKit was enabled and produced peaks
+            nk_count = lead1_nk_r_peaks if lead_num == 1 else lead2_nk_r_peaks
+            if nk_cfg.get("enabled", False) and (csharp_count > 0 or nk_count > 0):
+                if csharp_count == 0 and nk_count == 0:
+                    severity = 0.0
+                elif csharp_count == 0 or nk_count == 0:
+                    severity = 1.0
+                else:
+                    relative_diff = abs(csharp_count - nk_count) / max(csharp_count, nk_count)
+                    severity = float(np.clip((relative_diff - 0.10) / (0.50 - 0.10), 0.0, 1.0))
+
+                agg = agg_flags1 if lead_num == 1 else agg_flags2
+                agg["QRS_Count_Mismatch"] = severity
+
+                # Apply as post-hoc penalty to the all-window PSD score
+                penalty = mismatch_weight * severity
+                if lead_num == 1:
+                    q1_psd_all = max(0.0, q1_psd_all - penalty)
+                else:
+                    q2_psd_all = max(0.0, q2_psd_all - penalty)
+
     # Include NK fields in aggregated values
     lead1_values_agg["nk_quality"] = lead1_nk_quality
     lead2_values_agg["nk_quality"] = lead2_nk_quality
     lead1_values_agg["nk_r_peaks_count"] = lead1_nk_r_peaks
     lead2_values_agg["nk_r_peaks_count"] = lead2_nk_r_peaks
 
-    # Blend PSD (best-window) with NK (whole-signal) for final scores
+    # Blend PSD (all-window) with NK (whole-signal) for final scores
     nk_weight = nk_cfg.get("weight", 0.0) if nk_cfg.get("enabled", False) else 0.0
-    q1_avg = q1_psd_avg
-    q2_avg = q2_psd_avg
+    q1_avg = q1_psd_all
+    q2_avg = q2_psd_all
     if lead1_nk_quality is not None and nk_weight > 0:
-        q1_avg = q1_psd_avg * (1.0 - nk_weight) + lead1_nk_quality * nk_weight
+        q1_avg = q1_psd_all * (1.0 - nk_weight) + lead1_nk_quality * nk_weight
     if lead2_nk_quality is not None and nk_weight > 0:
-        q2_avg = q2_psd_avg * (1.0 - nk_weight) + lead2_nk_quality * nk_weight
+        q2_avg = q2_psd_all * (1.0 - nk_weight) + lead2_nk_quality * nk_weight
     overall = max(q1_avg, q2_avg)
 
     grade_thresholds = config["grade_thresholds"]
@@ -459,8 +514,10 @@ def analyze_holter_quality(
     return {
         "lead1_quality": q1_avg,
         "lead2_quality": q2_avg,
-        "lead1_psd_quality": q1_psd_avg,
-        "lead2_psd_quality": q2_psd_avg,
+        "lead1_psd_quality": q1_psd_all,
+        "lead2_psd_quality": q2_psd_all,
+        "lead1_psd_best_quality": q1_psd_best,
+        "lead2_psd_best_quality": q2_psd_best,
         "overall_quality": overall,
         "grade": grade,
         "lead1_flags": agg_flags1,

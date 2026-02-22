@@ -41,6 +41,7 @@ _THRESH_CONFIG = {
     "Low_SNR": {"min": 0.0, "max": 50.0, "step": 1.0, "format": "%.0f"},
 }
 _FLAG_NAMES = list(_THRESH_CONFIG.keys())
+_ALL_FLAG_NAMES = _FLAG_NAMES + ["QRS_Count_Mismatch"]
 _PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # -- Page config ---------------------------------------------------------------
@@ -103,9 +104,9 @@ def _populate_config_state(preset_name: str) -> None:
         )
         st.session_state[f"cfg_thresh_{flag_name}_low"] = float(bounds[0])
         st.session_state[f"cfg_thresh_{flag_name}_high"] = float(bounds[1])
-    # Weights — fill all known flags
+    # Weights — fill all known flags (including QRS_Count_Mismatch)
     weights = preset.get("flags_weights", {})
-    for flag_name in _FLAG_NAMES:
+    for flag_name in _ALL_FLAG_NAMES:
         st.session_state[f"cfg_weight_{flag_name}"] = float(
             weights.get(flag_name, fallback_weights.get(flag_name, 0.2))
         )
@@ -125,9 +126,17 @@ if "_pending_preset" in st.session_state:
     _switch_to = st.session_state.pop("_pending_preset")
     st.session_state["cfg_preset"] = _switch_to
     _populate_config_state(_switch_to)
-# Populate defaults on first run
+# Populate defaults on first run (or when new config keys are missing)
 elif "cfg_thresh_Muscle_Artifact_low" not in st.session_state:
     _populate_config_state(st.session_state["cfg_preset"])
+# Backfill new weight keys added after initial session was created
+elif "cfg_weight_QRS_Count_Mismatch" not in st.session_state:
+    _w = _cached_load_presets().get("presets", {}).get(
+        st.session_state.get("cfg_preset", ""), {}
+    ).get("flags_weights", {})
+    st.session_state["cfg_weight_QRS_Count_Mismatch"] = float(
+        _w.get("QRS_Count_Mismatch", 0.10)
+    )
 
 
 def _on_preset_change() -> None:
@@ -148,7 +157,7 @@ def _build_quality_config() -> dict:
         },
         "flags_weights": {
             flag: st.session_state.get(f"cfg_weight_{flag}", 0.2)
-            for flag in _FLAG_NAMES
+            for flag in _ALL_FLAG_NAMES
         },
         "neurokit": {
             "enabled": st.session_state.get("cfg_nk_enabled", False),
@@ -170,7 +179,7 @@ def _apply_optimized_config(config: dict) -> None:
         st.session_state[f"cfg_thresh_{flag_name}_low"] = float(bounds[0])
         st.session_state[f"cfg_thresh_{flag_name}_high"] = float(bounds[1])
     weights = config.get("flags_weights", {})
-    for flag_name in _FLAG_NAMES:
+    for flag_name in _ALL_FLAG_NAMES:
         st.session_state[f"cfg_weight_{flag_name}"] = float(weights.get(flag_name, 0.2))
     grades = config.get("grade_thresholds", {})
     st.session_state["cfg_grade_good"] = float(grades.get("good", 0.85))
@@ -339,7 +348,7 @@ with st.sidebar:
         # -- Flag Weights --
         st.subheader("Flag Weights")
 
-        for flag_name in _FLAG_NAMES:
+        for flag_name in _ALL_FLAG_NAMES:
             st.slider(
                 flag_name.replace("_", " "),
                 min_value=0.0,
@@ -348,7 +357,7 @@ with st.sidebar:
                 key=f"cfg_weight_{flag_name}",
             )
         weight_sum = sum(
-            st.session_state.get(f"cfg_weight_{f}", 0.2) for f in _FLAG_NAMES
+            st.session_state.get(f"cfg_weight_{f}", 0.2) for f in _ALL_FLAG_NAMES
         )
         st.caption(f"Weight sum: {weight_sum:.2f}")
         if abs(weight_sum - 1.0) > 0.05:
@@ -456,6 +465,7 @@ with st.sidebar:
                         st.session_state.get(f"cfg_thresh_{flag_name}_low", 0.0),
                         st.session_state.get(f"cfg_thresh_{flag_name}_high", 0.0),
                     ]
+                for flag_name in _ALL_FLAG_NAMES:
                     _save_preset["flags_weights"][flag_name] = st.session_state.get(
                         f"cfg_weight_{flag_name}", 0.2
                     )
@@ -796,7 +806,8 @@ if process_btn:
 
             # Quality analysis with config from sidebar
             quality = analyze_holter_quality(
-                lead1, lead2, sampling_rate=200, config=quality_config
+                lead1, lead2, sampling_rate=200, config=quality_config,
+                markers1=markers1, markers2=markers2,
             )
 
             all_results[fname] = {
@@ -879,7 +890,8 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
 
                     # Scores
                     st.markdown(f"**Overall Quality: {blended:.3f}**")
-                    score_parts = [f"PSD: {psd_q:.3f}"]
+                    psd_best_q = q.get(f"lead{lead_num}_psd_best_quality", psd_q)
+                    score_parts = [f"PSD (all): {psd_q:.3f}", f"PSD (best): {psd_best_q:.3f}"]
                     if nk_enabled and nk_q is not None:
                         score_parts.append(f"NK: {nk_q:.3f}")
                         score_parts.append(
@@ -917,6 +929,9 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                             if v is not None:
                                 suffix = f" {unit}" if unit else ""
                                 st.caption(f"{label}: {fmt % v}{suffix}")
+                        csharp_qrs = vals.get("csharp_qrs_count")
+                        if csharp_qrs is not None:
+                            st.caption(f"C# QRS count: {csharp_qrs}")
                         if nk_enabled:
                             nk_peaks = vals.get("nk_r_peaks_count", 0)
                             st.caption(f"NK R-peaks detected: {nk_peaks}")
@@ -976,7 +991,7 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                     height=300,
                     template="plotly_dark",
                 )
-                st.plotly_chart(win_fig, width="stretch")
+                st.plotly_chart(win_fig, width="stretch", key=f"win_chart_{fname}")
 
         # -- ECG Signal plots --
         with st.expander("ECG Signals", expanded=True):
@@ -1074,7 +1089,7 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
             fig.update_yaxes(title_text="Amplitude", row=1, col=1)
             fig.update_yaxes(title_text="Amplitude", row=2, col=1)
 
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, width="stretch", key=f"ecg_chart_{fname}")
 
         # -- Raw vs Filtered comparison --
         raw_open_key = f"raw_open_{fname}"
@@ -1126,7 +1141,7 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
             comp_fig.update_layout(
                 height=400, template="plotly_dark", xaxis2_title="Time (seconds)"
             )
-            st.plotly_chart(comp_fig, width="stretch")
+            st.plotly_chart(comp_fig, width="stretch", key=f"comp_chart_{fname}")
 
         # -- Heart Rate --
         with st.expander("Heart Rate Analysis"):
@@ -1172,4 +1187,4 @@ for tab, (fname, result) in zip(tabs, all_results.items()):
                     height=250,
                     template="plotly_dark",
                 )
-                st.plotly_chart(rr_fig, width="stretch")
+                st.plotly_chart(rr_fig, width="stretch", key=f"rr_chart_{fname}")
